@@ -1,6 +1,4 @@
-
-
-% Extract and clean accelerometer data
+%% Data Extraction and Preprocessing (unchanged)
 accelData = permute(out.Sensor_ACCEL.signals.values, [3 2 1]);
 timeVec   = out.Sensor_Time.time;
 accelXY = accelData(:,1:2);
@@ -8,7 +6,6 @@ validInd = ~any(isnan(accelXY),2);
 accelXY = accelXY(validInd,:);
 timeVec = timeVec(validInd);
 
-% Extract ground truth for evaluation
 GT_pos = out.GT_position.signals.values;
 N_gt = size(GT_pos,1);
 N_time = length(timeVec);
@@ -17,143 +14,183 @@ GT_xy = GT_pos(1:N,1:2);
 timeVec = timeVec(1:N);
 accelXY = accelXY(1:N,:);
 
-% Denoise accelerometer data by clipping outliers to [mean - std, mean + std]
-accelXY_denoised = accelXY;
-for j = 1:2
-    mu = mean(accelXY(:,j));
-    sigma = std(accelXY(:,j));
-    lower_bound = mu - sigma;
-    upper_bound = mu + sigma;
-    idx_lower = accelXY(:,j) < lower_bound;
-    idx_upper = accelXY(:,j) > upper_bound;
-    accelXY_denoised(idx_lower,j) = lower_bound;
-    accelXY_denoised(idx_upper,j) = upper_bound;
+% Apply median filter for robust denoising and Butterworth lowpass filter
+window_med = 3;
+accelXY_med = medfilt1(accelXY, window_med);
+fc = 10;  % cutoff frequency in Hz
+Fs = 1/mean(diff(timeVec));
+[b, a] = butter(4, fc/(Fs/2)); 
+accelXY_filt = filtfilt(b, a, accelXY_med);
+
+% Extract and interpolate ToF readings
+tof1_raw = out.Sensor_ToF1.signals.values(:,1);  % forward sensor
+tof2_raw = out.Sensor_ToF2.signals.values(:,1);    % left sensor
+tof3_raw = out.Sensor_ToF3.signals.values(:,1);    % right sensor
+
+if isfield(out.Sensor_ToF1,'time')
+    time_tof1 = out.Sensor_ToF1.time;
+else
+    time_tof1 = timeVec;
+end
+if isfield(out.Sensor_ToF2,'time')
+    time_tof2 = out.Sensor_ToF2.time;
+else
+    time_tof2 = timeVec;
+end
+if isfield(out.Sensor_ToF3,'time')
+    time_tof3 = out.Sensor_ToF3.time;
+else
+    time_tof3 = timeVec;
 end
 
-% Lowpass filter the denoised accelerometer data
-fc = 5;
-sampleInterval = 1/mean(diff(timeVec));
-accelXY_filt = lowpass(accelXY_denoised, fc, 1/sampleInterval);
-
-% Extract raw ToF readings
-tof1_raw = out.Sensor_ToF1.signals.values(:,1);  % center/forward
-tof2_raw = out.Sensor_ToF2.signals.values(:,1);  % right
-tof3_raw = out.Sensor_ToF3.signals.values(:,1);  % left
-
-% Determine ToF time vectors if available
-if isfield(out.Sensor_ToF1,'time'), time_tof1 = out.Sensor_ToF1.time; else, time_tof1 = timeVec; end
-if isfield(out.Sensor_ToF2,'time'), time_tof2 = out.Sensor_ToF2.time; else, time_tof2 = timeVec; end
-if isfield(out.Sensor_ToF3,'time'), time_tof3 = out.Sensor_ToF3.time; else, time_tof3 = timeVec; end
-
-% Interpolate ToF data onto the IMU time vector
 tof1 = interp1(time_tof1, tof1_raw, timeVec, 'linear', 'extrap');
-tof2 = interp1(time_tof2, tof2_raw, timeVec, 'linear', 'extrap');
-tof3 = interp1(time_tof3, tof3_raw, timeVec, 'linear', 'extrap');
+tof2 = interp1(time_tof2, tof2_raw, timeVec, 'linear', 'extrap');  
+tof3 = interp1(time_tof3, tof3_raw, timeVec, 'linear', 'extrap');  
 
-% Use the first few ground truth samples to estimate initial position
+%% EKF Initialization with 6-State Model
+% State vector: x = [x; y; vx; vy; ax; ay]
+x_est = zeros(6,1);
+% Initialize position at [0,0] with zero velocity and acceleration.
+% (Optionally, set acceleration from the first accelerometer measurement.)
+% x_est(5:6) = accelXY_filt(1,:)';
+
+% Initial covariance – tune these values based on system uncertainty
+P_est = diag([0.1, 0.1, 0.5, 0.5, 0.2, 0.2]);
+
+% Process noise covariance: allow for uncertainty in position, velocity,
+% and a random-walk model for acceleration.
+Q = diag([0.05, 0.005, 0.05, 0.05, std_accel_x^2, std_accel_y]);
+
+std_tof1 = std(tof1(1:init_samples));
+std_tof2 = std(tof2(1:init_samples));
+std_tof3 = std(tof3(1:init_samples));
+
+% For the accelerometer, you might have a predetermined std (or compute similarly)
 init_samples = 10;
-x0 = mean(GT_xy(1:init_samples,:), 1);
 
-% EKF initialization
-x_est = zeros(4,1);
-x_est(1:2) = x0';  % average initial position
-x_est(3:4) = [0; 0];
-P_est = diag([0.1, 0.1, 0.5, 0.5]);
-Q = diag([0.01, 0.01, 0.1, 0.1]);
-R = diag([0.05, 0.05, 0.05]);
+% Calculate the standard deviation for each accelerometer axis from the filtered data
+std_accel_x = std(accelXY_filt(1:init_samples,1));
+std_accel_y = std(accelXY_filt(1:init_samples,2));
 
-% Known wall positions (assuming a 2.4m square arena)
-D_front = 2.4;
-D_right = 0;
-D_left  = 2.4;
+% Update the measurement noise covariance matrix R
+% R is a 5x5 matrix in our combined measurement model:
+% [ tof1; tof2; tof3; ax; ay ]
+R = diag([std_tof1, std_tof2, std_tof3, std_accel_x^2, std_accel_y]);
 
-% ---------- Estimate ToF Biases from Initial Samples ----------
-% For the first few samples, the expected measurement from each sensor is:
-%   ToF1 (forward): 2.4 - x0(1)
-%   ToF2 (right):   x0(2) - 0
-%   ToF3 (left):    2.4 - x0(2)
-% Compare to the actual ToF readings in the same interval.
+% Box geometry and expected ToF measurements (set these per your setup)
+D_box = 2.4;  % Full box length
+expected_tof1 = 2.4;    % forward sensor
+expected_tof2 = 2.4;       % left sensor (distance to left wall)
+expected_tof3 = 0;          % right sensor
 
+% Compute initial ToF biases using first few samples
+init_samples = 10;
 actual_tof1 = mean(tof1(1:init_samples));
 actual_tof2 = mean(tof2(1:init_samples));
 actual_tof3 = mean(tof3(1:init_samples));
-
-expected_tof1 = (D_front - x0(1));
-expected_tof2 = (x0(2) - D_right);
-expected_tof3 = (D_left - x0(2));
-
 bias_tof1 = actual_tof1 - expected_tof1;
 bias_tof2 = actual_tof2 - expected_tof2;
 bias_tof3 = actual_tof3 - expected_tof3;
 
-x_est_hist = zeros(4, N);
+% Preallocate state history
+x_est_hist = zeros(6, N);
 x_est_hist(:,1) = x_est;
 
+%% EKF Loop (6-State Model)
 for k = 1:N-1
     dt = timeVec(k+1) - timeVec(k);
-    F = [1, 0, dt, 0;
-         0, 1, 0, dt;
-         0, 0, 1,  0;
-         0, 0, 0,  1];
-    B = [0.5*dt^2, 0;
-         0, 0.5*dt^2;
-         dt, 0;
-         0, dt];
-    u = accelXY_filt(k,:)';
     
-    % Prediction
-    x_pred = F*x_est + B*u;
-    P_pred = F*P_est*F' + Q;
+    % State transition model incorporating acceleration dynamics:
+    % x_k+1 = x_k + dt*vx + 0.5*dt^2*ax
+    % y_k+1 = y_k + dt*vy + 0.5*dt^2*ay
+    % vx_k+1 = vx_k + dt*ax
+    % vy_k+1 = vy_k + dt*ay
+    % ax_k+1 = ax_k   (random walk)
+    % ay_k+1 = ay_k
+    F = [1, 0, dt,  0, 0.5*dt^2,      0;
+         0, 1,  0, dt,      0, 0.5*dt^2;
+         0, 0,  1,  0,      dt,      0;
+         0, 0,  0,  1,       0,     dt;
+         0, 0,  0,  0,       1,      0;
+         0, 0,  0,  0,       0,      1];
+     
+    % Prediction step
+    x_pred = F * x_est;
+    P_pred = F * P_est * F' + Q;
     
-    % Correct the ToF measurements by subtracting the estimated biases
-    z1 = tof1(k+1) - bias_tof1;
-    z2 = tof2(k+1) - bias_tof2;
-    z3 = tof3(k+1) - bias_tof3;
-    z = [z1; z2; z3];
+    % Measurements:
+    % (a) ToF measurements (after subtracting initial bias)
+    z_tof = [tof1(k+1) - bias_tof1;
+             tof2(k+1) - bias_tof2;
+             tof3(k+1) - bias_tof3];
+    % (b) Accelerometer measurements (using filtered acceleration)
+    % Here we use the measurement at the next time step; alternatively, you
+    % can fuse the measurement from the current time step.
+    z_accel = accelXY_filt(k,:)';  
+    % Combine the measurements (total of 5 measurements)
+    z = [z_tof; z_accel];
     
-    % Measurement model
-    h = [D_front - x_pred(1);
-         x_pred(2) - D_right;
-         D_left - x_pred(2)];
-    
-    H = [-1,  0, 0, 0;
-          0,  1, 0, 0;
-          0, -1, 0, 0];
-    
+    % Measurement model:
+    % ToF sensors relate to position:
+    %   h1 = D_box - x        (forward sensor)
+    %   h2 = D_box - y        (left sensor)
+    %   h3 = y                (right sensor)
+    % Accelerometers measure acceleration directly:
+    %   h4 = ax
+    %   h5 = ay
+    h = [D_box - x_pred(1);
+         D_box - x_pred(2);
+         x_pred(2);
+         x_pred(5);
+         x_pred(6)];
+     
+    % Jacobian of h with respect to state x (5x6 matrix)
+    H = [ -1,    0,  0,  0,         0, 0;   % dh1/dx
+           0,   -1,  0,  0,         0, 0;   % dh2/dy
+           0,    1,  0,  0,         0, 0;   % dh3/dy
+           0,    0,  0,  0,         1, 0;   % dh4/d(ax)
+           0,    0,  0,  0,         0, 1];   % dh5/d(ay)
+       
+    % Innovation, covariance and Kalman gain
     y_innov = z - h;
     S = H * P_pred * H' + R;
     K = P_pred * H' / S;
     
-    % Update
-    x_est = x_pred + K*y_innov;
-    P_est = (eye(4) - K*H) * P_pred;
+    % Update step
+    x_est = x_pred + K * y_innov;
+    P_est = (eye(6) - K * H) * P_pred;
     x_est_hist(:,k+1) = x_est;
 end
 
-% No final transformations here (since you removed them)
+% Extract estimated positions for comparison (first two states)
 est_xy = [x_est_hist(1,:)', x_est_hist(2,:)'];
 
-error_vector = est_xy - GT_xy(1:N,1:2);
-rmse_xy = sqrt(mean(sum(error_vector.^2,2)));
-fprintf('RMSE (xy): %.6f m\n', rmse_xy);
+% For RMSE, align the starting point of the estimate to the ground truth.
+shift = GT_xy(1,:) - est_xy(1,:);
+est_xy_aligned = est_xy + repmat(shift, size(est_xy,1), 1);
 
+error_vector = est_xy_aligned - GT_xy(1:N,1:2);
+rmse_xy = sqrt(mean(sum(error_vector.^2,2)));
+fprintf('Aligned RMSE (xy) with 6-state EKF: %.6f m\n', rmse_xy);
+
+%% Plot Results
 figure;
 plot(GT_xy(:,1), GT_xy(:,2), 'k-', 'LineWidth', 1.5); hold on;
-plot(est_xy(:,1), est_xy(:,2), 'r--', 'LineWidth', 1.5);
+plot(est_xy_aligned(:,1), est_xy_aligned(:,2), 'r--', 'LineWidth', 1.5);
 xlabel('X Position [m]'); ylabel('Y Position [m]');
-title('2D Position Estimation: Ground Truth vs. EKF Estimate');
+title('Ground Truth vs. EKF Estimate (6-State Model)');
 legend('Ground Truth','EKF Estimate'); grid on; axis equal;
 
 figure;
 subplot(2,1,1);
 plot(timeVec, GT_xy(:,1), 'b-', 'LineWidth', 1.5); hold on;
-plot(timeVec, est_xy(:,1), 'r--', 'LineWidth', 1.5);
+plot(timeVec, est_xy_aligned(:,1), 'r--', 'LineWidth', 1.5);
 xlabel('Time [s]'); ylabel('X Position [m]');
 title('X Position: Ground Truth vs. EKF Estimate');
 legend('Ground Truth','EKF Estimate'); grid on;
 subplot(2,1,2);
 plot(timeVec, GT_xy(:,2), 'b-', 'LineWidth', 1.5); hold on;
-plot(timeVec, est_xy(:,2), 'r--', 'LineWidth', 1.5);
+plot(timeVec, est_xy_aligned(:,2), 'r--', 'LineWidth', 1.5);
 xlabel('Time [s]'); ylabel('Y Position [m]');
 title('Y Position: Ground Truth vs. EKF Estimate');
 legend('Ground Truth','EKF Estimate'); grid on;
