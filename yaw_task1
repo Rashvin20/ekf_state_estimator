@@ -1,157 +1,224 @@
-% Extract ground truth position
-GT = out.GT_position.signals.values;
-x_gt = GT(:,1);         
-y_gt = GT(:,2);         
+%% ------------------ Data Extraction and Preprocessing ------------------
+% Ensure that your "out" variable is loaded (e.g., load('myDataFile.mat');)
 
-figure;
-plot(x_gt, y_gt, 'k-', 'LineWidth', 1.5);
-xlabel('X [m]');
-ylabel('Y [m]');
-title('Ground Truth Trajectory');
-grid on;
-axis equal;
+% Extract time vector and compute number of samples.
+timeVec = out.Sensor_Time.time;   % [N x 1]
+N = length(timeVec);
 
+% --- Extract Gyro Data (assume 1x3xN; rearranged to [N x 3]) ---
+gyroData = permute(out.Sensor_GYRO.signals.values, [3, 2, 1]);  % [N x 3]
+% Use the z-axis (assumed third column) as angular velocity.
+omega_z = gyroData(:,3);  % [rad/s]
 
-[~,~,psi_all] = ekfBlock(out);
+% --- Extract Accelerometer and Magnetometer Data ---
+accelData = permute(out.Sensor_ACCEL.signals.values, [3, 2, 1]);  % [N x 3]
+magData   = permute(out.Sensor_MAG.signals.values, [3, 2, 1]);      % [N x 3]
 
+% --- Smoothing (using moving average for simplicity) ---
+windowSize = 100;
+accelData_smooth = movmean(accelData, windowSize);
+magData_smooth   = movmean(magData, windowSize);
 
-quat_GT = out.GT_rotation.signals.values;
-q = quaternion(quat_GT(:,1), quat_GT(:,2), quat_GT(:,3), quat_GT(:,4));
-q = normalize(q);  
-eul = quat2eul(q, 'ZYX');
-yaw_gt = eul(:,1);
+% --- Remove Biases (using your calibration constants) ---
+accelBias = [10.0026, 0.0277, -0.3965];  % in m/s^2
+magBias   = [0, 0, 0.0001];              % in uT
 
+accelData_corr = accelData_smooth - repmat(accelBias, N, 1);
+magData_corr   = magData_smooth - repmat(magBias, N, 1);
 
-N = min(length(psi_all), length(yaw_gt));
-yaw_est = wrapToPi(psi_all(1:N));
-yaw_gt = wrapToPi(yaw_gt(1:N));
+%% ------------------ Compute Compass Yaw (ψₘ) ------------------
+% For each time sample, compute roll & pitch from the accelerometer,
+% then tilt-compensate the magnetometer to obtain a yaw measurement.
 
+yaw_m = zeros(N,1);
+for i = 1:N
+    a = accelData_corr(i,:);  % [ax, ay, az]
+    m = magData_corr(i,:);    % [mx, my, mz]
+    
+    % Compute roll and pitch from accelerometer.
+    % Assuming sensor axes: x = lateral, y = forward, z = upward.
+    % For a level sensor, a ≈ [0, 0, -g].
+    roll_i  = atan2(-a(2), -a(3));
+    pitch_i = atan2(a(1), sqrt(a(2)^2 + a(3)^2));
+    
+    % Tilt-compensate the magnetometer:
+    mag_x_comp = m(1)*cos(pitch_i) - m(3)*sin(pitch_i);
+    mag_y_comp = m(1)*sin(roll_i)*sin(pitch_i) + m(2)*cos(roll_i) + m(3)*sin(roll_i)*cos(pitch_i);
+    
+    yaw_m(i) = atan2(mag_y_comp, mag_x_comp);
+end
+yaw_m = wrapToPi(yaw_m);
 
-valid_idx = ~isnan(yaw_est) & ~isnan(yaw_gt);
-yaw_error = wrapToPi(yaw_est(valid_idx) - yaw_gt(valid_idx));
+%% ------------------ Gyro Integration to Obtain ψ_g ------------------
+% Set the initial gyro yaw equal to the initial compass yaw:
+psi_g = zeros(N,1);
+psi_g(1) = yaw_m(1);
 
+for k = 1:N-1
+    dt = timeVec(k+1) - timeVec(k);
+    psi_g(k+1) = psi_g(k) + omega_z(k)*dt;
+end
+psi_g = wrapToPi(psi_g);
 
-yaw_rmse = sqrt(mean(yaw_error.^2));
-fprintf('Yaw RMSE: %.6f ', yaw_rmse);
+%% ------------------ Kalman Filter for Gyro Error Estimation ------------------
+% Our goal is to estimate the gyro yaw error δψ so that the true yaw is:
+%   ψ_true = ψ_g - δψ.
+%
+% We assume a state vector:
+%   x = [δψ; δk; b]
+% where δψ is the accumulated gyro yaw error, δk is a scale factor error,
+% and b is a bias error. The continuous-time model is:
+%
+%   d/dt δψ = ω * δk + b + u_ψ,
+%   d/dt δk = u_k,
+%   d/dt b  = u_b.
+%
+% In discrete time, with a time step dt and approximating integration with Euler’s method,
+% we use the state transition:
+%
+%   x(k+1) = F_k * x(k) + w(k)
+%
+% where
+%   F_k = [1, ω_z(k)*dt, dt;
+%          0,      1,    0;
+%          0,      0,    1].
+%
+% The measurement is:
+%   z(k) = ψ_g(k) - ψ_m(k) = δψ + v,
+% so the measurement matrix is H = [1, 0, 0].
 
+% Initialization:
+x_est = zeros(3,1);  % initial state: assume zero error.
+P_est = eye(3) * 0.001;  % small initial covariance.
 
-function [phi_all, theta_all, psi_all] = ekfBlock(out)
-acc = permute(out.Sensor_ACCEL.signals.values, [3 2 1]);
-gyro = permute(out.Sensor_GYRO.signals.values, [3 2 1]);
-magn = permute(out.Sensor_MAG.signals.values, [3 2 1]);
-time = out.Sensor_Time.time;
-N = size(acc, 1);
+% Process noise standard deviations (tune these experimentally)
+sigma_psi = 0.001;
+sigma_k   = 0.0001;
+sigma_b   = 0.0001;
+% Process noise covariance (discrete): Q_k = diag([sigma_psi^2, sigma_k^2, sigma_b^2])*dt.
+% We'll update Q_k at each time step.
+R_k = (0.05)^2;  % Measurement noise variance for yaw measurement (assumed)
 
-phi_all = zeros(N, 1);
-theta_all = zeros(N, 1);
-psi_all = zeros(N, 1);
+% Preallocate storage for the state estimates and corrected yaw.
+x_est_hist = zeros(3, N);
+x_est_hist(:,1) = x_est;
+psi_est = zeros(N,1);
+psi_est(1) = wrapToPi( psi_g(1) - x_est(1) );  % Corrected yaw = gyro yaw - δψ.
 
-acc_std = std(acc);
-gyro_std = std(gyro);
-magn_std = std(magn);
-
-acc_bias = mean(acc);
-gyro_bias = mean(gyro);
-magn_bias = mean(magn);
-
-x = zeros(3,1);
-P = eye(3)*0.1;
-P(3,3) = (180/pi)^2;
-
-dt = mean(diff(time));
-g = 9.81;
-M_inertial = [19437.4e-9; 181.2E-9; 45090.4E-9];
-Q = diag(gyro_std);
-R = diag([acc_std magn_std]);
-
-for k = 1:N
-    accX = acc(k,1) - acc_bias(1);
-    accY = acc(k,2) - acc_bias(2);
-    accZ = acc(k,3) - acc_bias(3);
-
-    gyroX = gyro(k,1) - gyro_bias(1);
-    gyroY = gyro(k,2) - gyro_bias(2);
-    gyroZ = gyro(k,3) - gyro_bias(3);
-
-    magX = magn(k,1) - magn_bias(1);
-    magY = magn(k,2) - magn_bias(2);
-    magZ = magn(k,3) - magn_bias(3);
-
-    phi_k = x(1);
-    theta_k = x(2);
-    psi_k = x(3);
-
-    p = gyroX;
-    q = gyroY;
-    r = gyroZ;
-
-    phi_dot = p + q*sin(phi_k)*tan(theta_k) + r*cos(phi_k)*tan(theta_k);
-    theta_dot = q*cos(phi_k) - r*sin(phi_k);
-    psi_dot = (q*sin(phi_k) + r*cos(phi_k)) / cos(theta_k);
-
-    x_pred = x + dt * [phi_dot; theta_dot; psi_dot];
-
-    F_ct = zeros(3);
-    F_ct(1,1) = q*cos(phi_k)*tan(theta_k) - r*sin(phi_k)*tan(theta_k);
-    sec2_th = 1/cos(theta_k)^2;
-    F_ct(1,2) = (q*sin(phi_k) + r*cos(phi_k)) * sec2_th;
-    F_ct(2,1) = -q*sin(phi_k) - r*cos(phi_k);
-    one_over_costh = 1 / cos(theta_k);
-    F_ct(3,1) = one_over_costh * (q*cos(phi_k) - r*sin(phi_k));
-    F_ct(3,2) = (q*sin(phi_k) + r*cos(phi_k)) * (sin(theta_k)/(cos(theta_k)^2));
-
-    F = eye(3) + dt * F_ct;
-    P_pred = F * P * F' + Q;
-
-    g_inertial = [0; 0; g];
-    phi_p = x_pred(1);
-    theta_p = x_pred(2);
-    psi_p = x_pred(3);
-    Rib = rotX(phi_p)*rotY(theta_p)*rotZ(psi_p);
-
-    acc_pred = Rib * g_inertial;
-    mag_pred = Rib * M_inertial;
-
-    z = [accX; accY; accZ; magX; magY; magZ];
-    z_pred = [acc_pred; mag_pred];
-
-    H = zeros(6,3);
-    eps = 1e-6;
-    for i = 1:3
-        x_shift = x_pred;
-        x_shift(i) = x_shift(i) + eps;
-        R_shift = rotX(x_shift(1))*rotY(x_shift(2))*rotZ(x_shift(3));
-        z_shift = [R_shift*g_inertial; R_shift*M_inertial];
-        H(:,i) = (z_shift - z_pred)/eps;
-    end
-
-    y = z - z_pred;
-    S = H * P_pred * H' + R;
+% Kalman filter loop:
+for k = 1:N-1
+    dt = timeVec(k+1) - timeVec(k);
+    
+    % State transition matrix F_k:
+    F = [1, omega_z(k)*dt, dt;
+         0, 1, 0;
+         0, 0, 1];
+    
+    % Process noise covariance Q_k:
+    Q_k = diag([sigma_psi^2, sigma_k^2, sigma_b^2]) * dt;
+    
+    % Prediction step:
+    x_pred = F * x_est;
+    P_pred = F * P_est * F' + Q_k;
+    
+    % Measurement: difference between gyro-integrated yaw and sensor-based yaw.
+    z_meas = psi_g(k+1) - yaw_m(k+1);
+    
+    % Measurement model: H = [1, 0, 0].
+    H = [1, 0, 0];
+    
+    % Innovation and its covariance:
+    y_innov = z_meas - H * x_pred;
+    S = H * P_pred * H' + R_k;
+    
+    % Kalman gain:
     K = P_pred * H' / S;
+    
+    % Update:
+    x_est = x_pred + K * y_innov;
+    P_est = (eye(3) - K * H) * P_pred;
+    
+    % Save state and compute corrected yaw:
+    x_est_hist(:, k+1) = x_est;
+    psi_est(k+1) = wrapToPi( psi_g(k+1) - x_est(1) );
+end
 
-    x = x_pred + K*y;
-    P = (eye(3) - K*H) * P_pred;
+%% ------------------ Post Processing ------------------
+figure;
+plot(timeVec, yaw_m, 'b-', 'LineWidth', 1.5); hold on;
+plot(timeVec, psi_g, 'k--', 'LineWidth', 1.5);
+plot(timeVec, psi_est, 'r-', 'LineWidth', 1.5);
+xlabel('Time [s]');
+ylabel('Yaw [rad]');
+legend('Compass Yaw ψ_m','Gyro-integrated Yaw ψ_g','Kalman Corrected Yaw ψ_{est}');
+title('Yaw Estimation Using Gyro Integration and Kalman Filter');
+grid on;
+%% Compute Ground Truth Yaw from Quaternion Data
+% Extract quaternion data from ground truth (assumed to be [N x 4] with order [w, x, y, z])
+quat_GT = out.GT_rotation.signals.values;  % [N x 4]
+q_GT = quaternion(quat_GT(:,1), quat_GT(:,2), quat_GT(:,3), quat_GT(:,4));
+q_GT = normalize(q_GT);
+eul_GT = quat2eul(q_GT, 'ZYX');  % Euler angles in [yaw, pitch, roll] order
+yaw_GT = wrapToPi(eul_GT(:,1));   % extract yaw and wrap to [-pi,pi]
 
-    phi_all(k) = x(1);
-    theta_all(k) = x(2);
-    psi_all(k) = x(3);
-end
-end
-function Rx = rotX(a)
- ca = cos(a); sa = sin(a);
- Rx = [1 0 0;
- 0 ca -sa;
- 0 sa ca];
-end
-function Ry = rotY(b)
- cb = cos(b); sb = sin(b);
- Ry = [ cb 0 sb;
- 0 1 0;
- -sb 0 cb];
-end
-function Rz = rotZ(c)
- cc = cos(c); sc = sin(c);
- Rz = [ cc -sc 0;
- sc cc 0;
- 0 0 1];
-end
+%% Compute RMSE between Estimated Yaw and Ground Truth Yaw
+% Ensure psi_est (Kalman-corrected yaw) is wrapped to [-pi, pi]
+psi_est = wrapToPi(psi_est);
+
+% Use the minimum length if necessary
+N_rmse = min(length(psi_est), length(yaw_GT));
+
+% Compute the error (taking care of angle wrapping)
+yaw_error = wrapToPi(psi_est(1:N_rmse) - yaw_GT(1:N_rmse));
+
+% RMSE calculation
+rmse_yaw = sqrt(mean(yaw_error.^2));
+fprintf('Yaw RMSE: %.4f rad (%.4f deg)\n', rmse_yaw, rad2deg(rmse_yaw));
+
+% Plot Ground Truth Yaw vs. Kalman Corrected Yaw
+figure;
+plot(timeVec(1:N_rmse), yaw_GT(1:N_rmse), 'b-', 'LineWidth', 1.5); hold on;
+plot(timeVec(1:N_rmse), psi_est(1:N_rmse), 'r--', 'LineWidth', 1.5);
+xlabel('Time [s]');
+ylabel('Yaw [rad]');
+title('Ground Truth Yaw vs. Kalman Corrected Yaw');
+legend('Ground Truth Yaw','Kalman Corrected Yaw');
+grid on;
+
+
+%% Calculate Ground Truth Yaw from Quaternion Data
+% Extract quaternion data (assumed order: [w, x, y, z])
+quat_GT = out.GT_rotation.signals.values;  % [N x 4]
+q_GT = quaternion(quat_GT(:,1), quat_GT(:,2), quat_GT(:,3), quat_GT(:,4));
+q_GT = normalize(q_GT);
+eul_GT = quat2eul(q_GT, 'ZYX');   % Euler angles in [yaw, pitch, roll] order
+yaw_GT = wrapToPi(eul_GT(:,1));    % Ground truth yaw wrapped to [-pi, pi]
+
+%Calculate RMSE between Gyro-Integrated Yaw and Ground Truth Yaw
+% Assume psi_g is the raw gyro-integrated yaw computed previously.
+% (For example, computed as:
+%   psi_g(1) = yaw_m(1);
+%   for k = 1:N-1, psi_g(k+1) = psi_g(k) + omega_z(k)*dt; end,
+%   psi_g = wrapToPi(psi_g);
+% )
+
+% Make sure psi_g and yaw_GT have the same length:
+N_rmse = min(length(psi_g), length(yaw_GT));
+
+% Compute the error while properly handling angle wrapping:
+yaw_error = wrapToPi( psi_g(1:N_rmse) - yaw_GT(1:N_rmse) );
+
+% RMSE calculation:
+rmse_gyro = sqrt(mean(yaw_error.^2));
+fprintf('RMSE between Gyro Estimated Yaw and Ground Truth Yaw: %.4f rad (%.4f deg)\n', ...
+    rmse_gyro, rad2deg(rmse_gyro));
+
+%% Plot for Visual Comparison
+figure;
+plot(timeVec(1:N_rmse), yaw_GT(1:N_rmse), 'b-', 'LineWidth', 1.5); hold on;
+plot(timeVec(1:N_rmse), psi_g(1:N_rmse), 'r--', 'LineWidth', 1.5);
+xlabel('Time [s]');
+ylabel('Yaw [rad]');
+title('Gyro-Integrated Yaw vs. Ground Truth Yaw');
+legend('Ground Truth Yaw','Gyro-Integrated Yaw');
+grid on;
