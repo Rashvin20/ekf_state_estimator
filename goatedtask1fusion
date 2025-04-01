@@ -1,6 +1,17 @@
 [X_Est, P_Est, GT] = myEKF(out);
 
-error = GT(:,1:2) - X_Est(:,1:2);
+
+est_xy = X_Est(:, 1:2);
+gt_xy  = GT(:, 1:2);
+
+% Align the estimated trajectory with the ground truth by computing a shift based on the first sample
+shift = gt_xy(1,:) - est_xy(1,:);
+est_xy_aligned = est_xy + repmat(shift, size(est_xy,1), 1);
+
+% Compute the error vector for each time step and then the RMSE
+error = est_xy_aligned - gt_xy;
+
+%error = GT(:,1:2) - X_Est(:,1:2);
 rmse = sqrt(mean(sum(error.^2,2)));
 fprintf('RMSE (XY) = %.4f m\n', rmse);
 
@@ -135,8 +146,8 @@ P_est_hist(:,:,1) = P_est_pos;
 
 % Run the EKF loop for position
 for k = 1:N-1
-    dt = timeVec(k+1) - timeVec(k);
-    
+    %dt = timeVec(k+1) - timeVec(k);
+    dt = 0.02; %200 Hz
     % State transition matrix F (constant acceleration model)
     F = [1, 0, dt,      0, 0.5*dt^2,      0;
          0, 1,  0,     dt,      0, 0.5*dt^2;
