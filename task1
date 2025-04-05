@@ -1,0 +1,235 @@
+%% Group 1 
+%% Rashvin , Adam, Gam
+
+
+%% This code solves task 1.....
+
+[X_Est, P_Est] = myEKF(out);
+
+
+N=2447;
+gt_quat = out.GT_rotation.signals.values(1:N,:);
+    estimated_yaw = X_Est(5,:)';
+    gt_yaw = zeros(N,1);
+
+    for i = 1:N
+        q = quaternion(gt_quat(i,1), gt_quat(i,2), gt_quat(i,3), gt_quat(i,4));
+        euler = eulerd(q, 'ZYX', 'frame');
+        gt_yaw(i) = deg2rad(euler(1));
+    end
+
+    % Handle angle wrapping
+    yaw_error = mod(estimated_yaw - gt_yaw + pi, 2*pi) - pi;
+    rmse = sqrt(mean(yaw_error.^2));
+    fprintf('Yaw RMSE: %.4f rad (%.2f°)\n', rmse, rad2deg(rmse));
+
+figure;
+subplot(2,1,1);
+plot(timeVec(1:N), rad2deg(estimated_yaw), 'b', 'LineWidth', 1.5);
+hold on;
+plot(timeVec(1:N), rad2deg(gt_yaw), 'r--', 'LineWidth', 1.5);
+xlabel('Time (s)');
+ylabel('Yaw Angle (°)');
+title('Yaw Angle Comparison');
+legend('Estimated', 'Ground Truth');
+grid on;
+
+subplot(2,1,2);
+plot(timeVec(1:N), rad2deg(yaw_error), 'k', 'LineWidth', 1);
+xlabel('Time (s)');
+ylabel('Yaw Error (°)');
+title('Yaw Estimation Error');
+grid on;
+
+estimated_xy = [X_Est(1,:)', X_Est(2,:)'];
+
+
+
+
+% Assuming your solution is of name X_Est
+
+
+% ------------------ Extract data from 'out' ------------------ %
+pos   = out.GT_position.signals.values;  % Nx3
+rot   = out.GT_rotation.signals.values;  % Nx4 (quaternion WXYZ)
+timeVec  = out.GT_position.time;            % Nx1 or 1xN
+
+% ------------------ Debug: show original sizes ------------------ %
+fprintf('\n--- Debug Info: Original Data sizes ---\n');
+fprintf('GT_position:     %s\n', mat2str(size(pos)));
+fprintf('GT_rotation:     %s\n', mat2str(size(rot)));
+
+
+% ------------------ Truncate all signals to the shortest length ------------------ %
+N = min([size(pos,1), size(rot,1), size(timeVec,1)]);
+fprintf('--- Debug Info: Truncating signals to length N = %d ---\n\n', N);
+
+
+% ------------------ Convert Ground Truth to rigidtform3d ------------------ %
+gtTforms(N) = rigidtform3d;  % Preallocate
+for i = 1:N
+    qGT = quaternion(rot(i,1), rot(i,2), rot(i,3), rot(i,4));  
+    RGT = rotmat(qGT, 'frame');  % Aerospace Toolbox
+    tGT = pos(i,:);
+    gtTforms(i) = rigidtform3d(RGT, tGT);
+end
+
+% ------------------ Naive IMU Integration (dead-reckoning) ------------------ %
+estPos  = zeros(N,3);
+estVel  = zeros(N,3);
+estQuat = repmat([1 0 0 0], N,1);  % start as identity quaternion
+
+
+
+% ------------------ Convert Estimated States to rigidtform3d ------------------ %
+estTforms(N) = rigidtform3d;  % Preallocate
+
+for i = 1:N
+    qEst = quaternion(1, 0, 0, 0);
+    REst = rotmat(qEst, 'frame');
+    tEst(1)= estimated_xy(i,1);
+    tEst(2)= estimated_xy(i,2);
+    tEst(3)= 0;
+    estTforms(i) = rigidtform3d(REst, tEst);
+end
+
+% ------------------ Compare Trajectories ------------------ %
+try
+    mtrics= compareTrajectories(estTforms,gtTforms, 'AlignmentType', 'rigid');
+    disp(['Absolute RMSE for key frame location (m): ', num2str(mtrics.AbsoluteRMSE(2))]);
+    figure
+    ax = plot(mtrics, "absolute-translation");
+    disp('--- Debug Info: compareTrajectories executed successfully. ---');
+
+catch ME
+    warning('Failed to compare trajectories: %s', ME.message);
+end
+
+disp('--- End of navie_solution script ---');
+
+
+
+
+function [X_Est, P_Est] = myEKF(out)
+    %% Initialization and Data Extraction
+    timeVec = out.Sensor_Time.time(:);
+    N = length(timeVec);
+    D_box = 2.4;  % Arena dimension
+
+    %% --- Sensor Data Reshaping ---
+    % Accelerometer (1×3×N → N×3)
+    accData = permute(out.Sensor_ACCEL.signals.values, [3 2 1]);
+    acc_right = accData(:,1) - mean(accData(1:500,1));  % X-axis (right)
+    acc_forward = accData(:,2) - mean(accData(1:500,2));  % Y-axis (forward)
+
+    % Gyroscope (1×3×N → N×3)
+    gyroData = permute(out.Sensor_GYRO.signals.values, [3 2 1]);
+    yaw_rate = gyroData(:,3) - mean(gyroData(1:500,3));  % Z-axis (yaw rate)
+
+    %% --- Magnetometer Processing ---
+    % Reshape from 1×3×N to N×3
+    magData = permute(out.Sensor_MAG.signals.values, [3 2 1]);  % Now N×3
+
+    mag_x = magData(:,1);  % X-right
+    mag_y = magData(:,2);  % Y-forward
+
+    %% --- Sensor Filtering ---
+    [b, a] = butter(4, 5/(100/2));  % 5Hz cutoff
+    acc_forward_filt = filtfilt(b, a, acc_forward);
+    acc_right_filt = filtfilt(b, a, acc_right);
+    yaw_rate_filt = filtfilt(b, a, yaw_rate);
+
+    %% --- ToF Processing ---
+    % ToF1 = forward (Y-axis), ToF2 = right (X-axis)
+    tof1 = squeeze(out.Sensor_ToF1.signals.values(:,1,:));  % 1×1×N → N×1
+    tof2 = squeeze(out.Sensor_ToF2.signals.values(:,1,:));  % 1×1×N → N×1
+    tof_filt = movmean([tof2, tof1], 30);  % [X-right, Y-forward]
+    tof_filt(tof_filt > 2.5 | tof_filt < 0.1) = NaN;
+    tof_filt = fillmissing(tof_filt, 'previous');
+
+    %% --- EKF Initialization ---
+    state_dim = 6;  % [x; y; vx; vy; θ; b_ω]
+    
+    % Initial yaw from magnetometer
+    init_yaw = atan2(mean(mag_y(1:200)), mean(mag_x(1:200)));
+    
+    x_est = [D_box - tof_filt(1,1);  % x (right)
+             D_box - tof_filt(1,2);  % y (forward)
+             0;                       % vx
+             0;                       % vy
+             init_yaw;                % θ
+             mean(yaw_rate(1:500))];  % b_ω
+    
+    P_est = diag([0.1, 0.1, 0.05, 0.05, 0.01, 0.001].^2);
+    Q = diag([0.001, 0.001, 0.01, 0.01, 0.00001, 1e-8].^2);
+
+    %% --- EKF Main Loop ---
+    X_Est = zeros(state_dim, N);
+    P_Est = zeros(state_dim, state_dim, N);
+    X_Est(:,1) = x_est;
+    P_Est(:,:,1) = P_est;
+
+    for k = 1:N-1
+        dt = timeVec(k+1) - timeVec(k);
+        theta = x_est(5);
+
+        %% --- Prediction Step ---
+        % World frame accelerations
+        ax_world = acc_right_filt(k)*cos(theta) - acc_forward_filt(k)*sin(theta);
+        ay_world = acc_right_filt(k)*sin(theta) + acc_forward_filt(k)*cos(theta);
+
+        % State transition matrix
+        F = eye(6);
+        F(1,3) = dt;
+        F(2,4) = dt;
+
+        % State prediction
+        x_pred = x_est + [x_est(3)*dt;
+                          x_est(4)*dt;
+                          ax_world*dt;
+                          ay_world*dt;
+                          (yaw_rate_filt(k) - x_est(6))*dt;
+                          0];
+
+        % Covariance prediction
+        P_pred = F * P_est * F' + Q;
+
+        %% --- Magnetometer Update ---
+        if mod(k,5) == 0  % Update every 5 steps
+            H_mag = [0 0 0 0 1 0];
+            mag_yaw = atan2(mag_y(k), mag_x(k));
+            yaw_innov = mod(mag_yaw - x_pred(5) + pi, 2*pi) - pi;
+            
+            R_mag = 0.02^2;
+            S = H_mag * P_pred * H_mag' + R_mag;
+            K = P_pred * H_mag' / S;
+            x_pred = x_pred + K * yaw_innov;
+            P_pred = (eye(6) - K * H_mag) * P_pred;
+        end
+
+        %% --- ToF Update ---
+        H_tof = [-1 0 0 0 0 0;   % x (right)
+                  0 -1 0 0 0 0];  % y (forward)
+        z_tof = [tof_filt(k+1,1);
+                 tof_filt(k+1,2)];
+        z_pred = [D_box - x_pred(1);
+                  D_box - x_pred(2)];
+        
+        R_tof = diag([0.05^2, 0.05^2]);
+        innov = z_tof - z_pred;
+        S = H_tof * P_pred * H_tof' + R_tof;
+        K = P_pred * H_tof' / S;
+        
+        x_est = x_pred + K * innov;
+        P_est = (eye(6) - K * H_tof) * P_pred;
+
+        %% Store Results
+        X_Est(:,k+1) = x_est;
+        P_Est(:,:,k+1) = P_est;
+    end
+
+    %% --- Post-Processing ---
+    % Force constant yaw for straight-line motion
+    avg_yaw = median(X_Est(5,500:end-500));
+    X_Est(5,:) = avg_yaw;
+end
