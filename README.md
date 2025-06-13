@@ -31,4 +31,4 @@ Implemented using an **Extended Kalman Filter (EKF)** framework.
 
 ## Usage
 
-1. Open `state_estimator.m` in MATLAB.
+1. Open `task1_final` in MATLAB.
