@@ -6,13 +6,13 @@ This project addresses the **Sub-Terranean Navigation Challenge** where a robot 
 - **IMU sensors** (accelerometer, gyroscope, magnetometer)
 - **Time-of-Flight (ToF) distance sensors**
 
-The file `state_estimator.m` contains the MATLAB implementation of the **sensor fusion algorithm** used to estimate the robot's state in real-time.
+The file `task1_final` contains the MATLAB implementation of the **sensor fusion algorithm** used to estimate the robot's state in real-time.
 
 ---
 
 ## File Structure
 
-- `state_estimator.m`: Main code that performs state estimation using sensor fusion techniques (e.g., Extended Kalman Filter).
+- `task1_final`: Main code that performs state estimation using sensor fusion techniques (e.g., Extended Kalman Filter).
 
 
 ---
