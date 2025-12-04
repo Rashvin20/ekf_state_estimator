@@ -1,21 +1,22 @@
 import cv2
 import numpy as np
 import time
+import serial
 from collections import deque
 from picamera2 import Picamera2
-import serial
 
 # -----------------------------------------
 # USER SETTINGS
 # -----------------------------------------
-pivot = (160, 60)     # adjust for your setup
+pivot = (160, 60)          # pivot location in cropped frame
 SMOOTHING_WINDOW = 5
+PENDULUM_LENGTH_M = 1.70   # 170 cm = 1.70 m
 
-# ---- GREEN COLOR RANGE ----
+# Green HSV range
 GREEN_LOWER = np.array([40, 40, 40], dtype=np.uint8)
 GREEN_UPPER = np.array([85, 255, 255], dtype=np.uint8)
 
-# smoothing buffers
+# Buffers
 angle_buffer = deque(maxlen=SMOOTHING_WINDOW)
 velocity_buffer = deque(maxlen=SMOOTHING_WINDOW)
 
@@ -23,17 +24,18 @@ last_angle = None
 last_time = time.time()
 
 # -----------------------------------------
-# SERIAL OUTPUT (TO ESP32 / NUCLEO)
+# SERIAL SETUP
 # -----------------------------------------
-SERIAL_PORT = "/dev/ttyACM0"   # CHANGE IF NEEDED
+SERIAL_PORT = "/dev/ttyACM0"  # change if needed
 BAUD = 115200
 
 try:
     ser = serial.Serial(SERIAL_PORT, BAUD, timeout=1)
-    print(f"[OK] Serial connected to {SERIAL_PORT}")
+    print(f"[OK] Serial connected: {SERIAL_PORT}")
 except Exception as e:
-    print(f"[WARNING] Serial not available: {e}")
+    print(f"[WARNING] Serial not available ({e})")
     ser = None
+
 
 # -----------------------------------------
 # INITIALISE PI CAMERA
@@ -48,7 +50,8 @@ except Exception as e:
     print("Camera failed to start:", e)
     exit()
 
-print("Camera initialised. Tracking GREEN ball...")
+print("Camera initialized. Tracking GREEN ball...")
+
 
 # -----------------------------------------
 # MAIN LOOP
@@ -56,7 +59,7 @@ print("Camera initialised. Tracking GREEN ball...")
 while True:
     frame = picam2.capture_array()
 
-    # crop to focus (optional)
+    # crop to reduce processing (adjust if needed)
     frame = frame[20:220, 40:280]
 
     display = frame.copy()
@@ -76,65 +79,71 @@ while True:
         c = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(c)
 
-        if area > 100:  
+        if area > 100:
             M = cv2.moments(c)
             cx = int(M["m10"] / M["m00"])
             cy = int(M["m01"] / M["m00"])
 
+            # Draw
             cv2.circle(display, (cx, cy), 6, (0, 255, 0), -1)
             cv2.circle(display, pivot, 6, (255, 255, 0), -1)
             cv2.line(display, pivot, (cx, cy), (255, 255, 0), 2)
 
-            # -------------------------
-            # ANGLE COMPUTATION
-            # -------------------------
+            # -----------------------------------------
+            # ANGLE (degrees)
+            # -----------------------------------------
             dx = cx - pivot[0]
             dy = cy - pivot[1]
-
             angle = np.degrees(np.arctan2(dx, dy))
+
             angle_buffer.append(angle)
             smooth_angle = np.mean(angle_buffer)
 
-            # -------------------------
-            # VELOCITY
-            # -------------------------
+            # -----------------------------------------
+            # ANGULAR VELOCITY (deg/s)
+            # -----------------------------------------
             now = time.time()
             dt = now - last_time
             last_time = now
 
             if last_angle is None:
                 last_angle = smooth_angle
-                velocity = 0
+                ang_vel_deg = 0
             else:
                 dtheta = smooth_angle - last_angle
 
                 # wrap-around fix
-                if dtheta > 180:
-                    dtheta -= 360
-                if dtheta < -180:
-                    dtheta += 360
+                if dtheta > 180: dtheta -= 360
+                if dtheta < -180: dtheta += 360
 
-                velocity = dtheta / dt
+                ang_vel_deg = dtheta / dt
                 last_angle = smooth_angle
 
-            velocity_buffer.append(velocity)
-            smooth_velocity = np.mean(velocity_buffer)
+            velocity_buffer.append(ang_vel_deg)
+            ang_vel_deg_smooth = np.mean(velocity_buffer)
 
-            # -------------------------
-            # SERIAL OUTPUT
-            # -------------------------
+            # -----------------------------------------
+            # CONVERT TO LINEAR VELOCITY (m/s)
+            # -----------------------------------------
+            ang_vel_rad = ang_vel_deg_smooth * (np.pi / 180)
+            linear_velocity = ang_vel_rad * PENDULUM_LENGTH_M
+
+            # -----------------------------------------
+            # PRINT + SERIAL OUTPUT
+            # -----------------------------------------
+            print(f"{linear_velocity:.3f} m/s")
+
             if ser is not None:
                 try:
-                    ser.write(f"{smooth_velocity:.3f}\n".encode())
+                    ser.write(f"{linear_velocity:.3f}\n".encode())
                 except:
                     pass
 
-            # -------------------------
-            # DISPLAY TEXT
-            # -------------------------
-            cv2.putText(display, f"Velocity: {smooth_velocity:.2f} deg/s",
-                        (20, 60), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7, (0, 255, 0), 2)
+            # -----------------------------------------
+            # SHOW ON SCREEN
+            # -----------------------------------------
+            cv2.putText(display, f"v = {linear_velocity:.2f} m/s",
+                        (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
     cv2.imshow("Mask", mask)
     cv2.imshow("Tracking", display)
@@ -142,9 +151,6 @@ while True:
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# -----------------------------------------
-# CLEANUP
-# -----------------------------------------
 picam2.close()
 cv2.destroyAllWindows()
 
