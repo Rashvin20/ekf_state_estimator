@@ -1,0 +1,44 @@
+class SpeedNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.block1 = nn.Sequential(
+            nn.Linear(1, 64),
+            nn.SiLU(),          # smoother & better than ReLU
+        )
+
+        self.block2 = nn.Sequential(
+            nn.Linear(64, 128),
+            nn.SiLU(),
+            nn.Dropout(0.1),    # stabilises training
+        )
+
+        self.block3 = nn.Sequential(
+            nn.Linear(128, 128),
+            nn.SiLU(),
+            nn.Dropout(0.1),
+        )
+
+        self.block4 = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.SiLU()
+        )
+
+        self.out = nn.Linear(64, 1)
+
+        # residual projection for skip connections
+        self.res_projection = nn.Linear(64, 128)
+
+    def forward(self, x):
+        # expand representation
+        x1 = self.block1(x)
+        x2 = self.block2(x1)
+
+        # residual: project 64 → 128 so shapes match
+        res = self.res_projection(x1)
+
+        x3 = self.block3(x2 + res)   # add skip connection
+        x4 = self.block4(x3)
+
+        return self.out(x4)
+
