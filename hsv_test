@@ -1,0 +1,33 @@
+import cv2
+import numpy as np
+from picamera2 import Picamera2
+import time
+
+# Start Pi camera
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(main={"size": (640, 480)}))
+picam2.start()
+time.sleep(1)  # allow camera to warm up
+
+# Mouse callback: when user clicks, print HSV value
+def show_hsv(event, x, y, flags, param):
+    if event == cv2.EVENT_LBUTTONDOWN:
+        frame = param["frame"]
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        pixel = hsv[y, x]
+        print(f"Clicked HSV at ({x}, {y}): {pixel}")
+
+cv2.namedWindow("HSV Sampler")
+
+param = {"frame": None}
+cv2.setMouseCallback("HSV Sampler", show_hsv, param)
+
+while True:
+    frame = picam2.capture_array()
+    param["frame"] = frame
+
+    cv2.imshow("HSV Sampler", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cv2.destroyAllWindows()
