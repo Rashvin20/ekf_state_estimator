@@ -1,0 +1,143 @@
+import cv2
+import numpy as np
+import time
+import serial
+import torch
+import pickle
+from collections import deque
+from picamera2 import Picamera2
+
+# ============================================================
+# LOAD TRAINED NEURAL NETWORK + SCALERS
+# ============================================================
+class SpeedNet(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(1, 32),
+            torch.nn.ReLU(),
+            torch.nn.Linear(32, 32),
+            torch.nn.ReLU(),
+            torch.nn.Linear(32, 1)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+# Load model weights
+model = SpeedNet()
+model.load_state_dict(torch.load("weights_only.pth", map_location="cpu"))
+model.eval()
+
+# Load scalers
+scaler_x = pickle.load(open("scaler_x.pkl", "rb"))
+scaler_y = pickle.load(open("scaler_y.pkl", "rb"))
+
+print("[OK] Neural network + scalers loaded")
+
+# ============================================================
+# CAMERA / SERIAL CONFIG
+# ============================================================
+pivot = (120, 50)
+SMOOTHING_WINDOW = 5
+
+GREEN_LOWER = np.array([40, 150, 100], dtype=np.uint8)
+GREEN_UPPER = np.array([60, 250, 150], dtype=np.uint8)
+
+angle_buffer = deque(maxlen=SMOOTHING_WINDOW)
+
+SERIAL_PORT = "/dev/ttyAMA0"
+BAUD = 115200
+
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD, timeout=1)
+    print("[OK] Serial connected")
+except:
+    ser = None
+    print("[WARN] Serial offline")
+
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(main={"size": (320, 240)}))
+picam2.start()
+time.sleep(1)
+
+print("Camera initialized. Running NN speed inference...\n")
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+while True:
+    frame = picam2.capture_array()
+    frame = frame[20:220, 40:280]
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER)
+    mask = cv2.GaussianBlur(mask, (7, 7), 0)
+    mask = cv2.erode(mask, None, iterations=1)
+    mask = cv2.dilate(mask, None, iterations=2)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if contours:
+        c = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(c)
+
+        if area > 80:
+            M = cv2.moments(c)
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+
+            # Compute angle (0–90°)
+            dx = cx - pivot[0]
+            dy = cy - pivot[1]
+            angle = abs(np.degrees(np.arctan2(abs(dx), dy)))
+            angle = max(0, min(angle, 90))
+
+            # Smooth angle slightly
+            angle_buffer.append(angle)
+            smooth_angle = float(np.mean(angle_buffer))
+
+            # ======================================================
+            # RUN NEURAL NETWORK TO PREDICT SPEED
+            # ======================================================
+            # Normalize angle
+            x_norm = scaler_x.transform([[smooth_angle]])
+            x_tensor = torch.tensor(x_norm, dtype=torch.float32)
+
+            # NN forward
+            with torch.no_grad():
+                y_pred_norm = model(x_tensor).item()
+
+            # Convert back to real speed (m/s)
+            speed_mps = scaler_y.inverse_transform([[y_pred_norm]])[0][0]
+
+            # ======================================================
+            # PRINT + SERIAL OUTPUT
+            # ======================================================
+            print(f"{speed_mps:.3f} m/s")
+
+            if ser:
+                try:
+                    ser.write(f"{speed_mps:.3f}\n".encode())
+                except:
+                    pass
+
+            # ======================================================
+            # SHOW PREVIEW
+            # ======================================================
+            display = frame.copy()
+            cv2.circle(display, (cx, cy), 5, (0, 255, 0), -1)
+            cv2.circle(display, pivot, 5, (255, 255, 0), -1)
+            cv2.line(display, pivot, (cx, cy), (255, 255, 0), 2)
+            cv2.putText(display, f"{speed_mps:.2f} m/s", (10, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            cv2.imshow("Tracking", display)
+            cv2.imshow("Mask", mask)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+picam2.close()
+cv2.destroyAllWindows()
+if ser: ser.close()
