@@ -8,13 +8,13 @@ from picamera2 import Picamera2
 # -----------------------------------------
 # USER SETTINGS
 # -----------------------------------------
-pivot = (160, 60)          # pivot location in cropped frame
+pivot = (120, 50)     # pivot in cropped frame
 SMOOTHING_WINDOW = 5
-PENDULUM_LENGTH_M = 1.70   # 170 cm = 1.70 m
+PENDULUM_LENGTH_M = 1.70   # length in meters
 
-# Green HSV range
-GREEN_LOWER = np.array([40, 40, 40], dtype=np.uint8)
-GREEN_UPPER = np.array([85, 255, 255], dtype=np.uint8)
+# Your green colour range
+GREEN_LOWER = np.array([40, 200, 110], dtype=np.uint8)
+GREEN_UPPER = np.array([50, 220, 130], dtype=np.uint8)
 
 # Buffers
 angle_buffer = deque(maxlen=SMOOTHING_WINDOW)
@@ -26,7 +26,7 @@ last_time = time.time()
 # -----------------------------------------
 # SERIAL SETUP
 # -----------------------------------------
-SERIAL_PORT = "/dev/ttyACM0"  # change if needed
+SERIAL_PORT = "/dev/ttyAMA0"
 BAUD = 115200
 
 try:
@@ -38,7 +38,7 @@ except Exception as e:
 
 
 # -----------------------------------------
-# INITIALISE PI CAMERA
+# INITIALISE PICAMERA2
 # -----------------------------------------
 picam2 = Picamera2()
 picam2.configure(picam2.create_preview_configuration(main={"size": (320, 240)}))
@@ -50,19 +50,20 @@ except Exception as e:
     print("Camera failed to start:", e)
     exit()
 
-print("Camera initialized. Tracking GREEN ball...")
-
+print("Camera initialized. Tracking GREEN marker...")
 
 # -----------------------------------------
-# MAIN LOOP
+# MAIN LOOP (200 Hz)
 # -----------------------------------------
 while True:
+
+    loop_start = time.time()
+
     frame = picam2.capture_array()
 
-    # crop to reduce processing (adjust if needed)
+    # Crop to reduce noise and speed up processing
     frame = frame[20:220, 40:280]
 
-    display = frame.copy()
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
     # mask for GREEN
@@ -71,88 +72,80 @@ while True:
     mask = cv2.erode(mask, None, iterations=1)
     mask = cv2.dilate(mask, None, iterations=2)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    cx = cy = None
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
 
     if contours:
         c = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(c)
 
-        if area > 100:
+        if area > 80:
             M = cv2.moments(c)
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
 
-            # Draw
-            cv2.circle(display, (cx, cy), 6, (0, 255, 0), -1)
-            cv2.circle(display, pivot, 6, (255, 255, 0), -1)
-            cv2.line(display, pivot, (cx, cy), (255, 255, 0), 2)
+                # -----------------------------------------
+                # PROPER ANGLE COMPUTATION (0–90 degrees)
+                # -----------------------------------------
+                dx = cx - pivot[0]
+                dy = cy - pivot[1]
 
-            # -----------------------------------------
-            # ANGLE (degrees)
-            # -----------------------------------------
-            dx = cx - pivot[0]
-            dy = cy - pivot[1]
-            angle = np.degrees(np.arctan2(dx, dy))
+                # Angle between vertical and rod
+                angle = abs(np.degrees(np.arctan2(abs(dx), dy)))
 
-            angle_buffer.append(angle)
-            smooth_angle = np.mean(angle_buffer)
+                # Clamp to 0–90
+                angle = max(0, min(angle, 90))
 
-            # -----------------------------------------
-            # ANGULAR VELOCITY (deg/s)
-            # -----------------------------------------
-            now = time.time()
-            dt = now - last_time
-            last_time = now
+                # Smooth the angle
+                angle_buffer.append(angle)
+                smooth_angle = np.mean(angle_buffer)
 
-            if last_angle is None:
-                last_angle = smooth_angle
-                ang_vel_deg = 0
-            else:
-                dtheta = smooth_angle - last_angle
+                # -----------------------------------------
+                # ANGULAR VELOCITY
+                # -----------------------------------------
+                now = time.time()
+                dt = now - last_time
+                last_time = now
 
-                # wrap-around fix
-                if dtheta > 180: dtheta -= 360
-                if dtheta < -180: dtheta += 360
+                if last_angle is None:
+                    last_angle = smooth_angle
+                    ang_vel_deg = 0
+                else:
+                    ang_vel_deg = (smooth_angle - last_angle) / dt
+                    last_angle = smooth_angle
 
-                ang_vel_deg = dtheta / dt
-                last_angle = smooth_angle
+                velocity_buffer.append(ang_vel_deg)
+                ang_vel_deg_smooth = np.mean(velocity_buffer)
 
-            velocity_buffer.append(ang_vel_deg)
-            ang_vel_deg_smooth = np.mean(velocity_buffer)
+                # Convert to linear velocity
+                ang_vel_rad = ang_vel_deg_smooth * (np.pi / 180)
+                linear_velocity = ang_vel_rad * PENDULUM_LENGTH_M
 
-            # -----------------------------------------
-            # CONVERT TO LINEAR VELOCITY (m/s)
-            # -----------------------------------------
-            ang_vel_rad = ang_vel_deg_smooth * (np.pi / 180)
-            linear_velocity = ang_vel_rad * PENDULUM_LENGTH_M
+                # If moving backwards → clamp
+                if linear_velocity < 0:
+                    linear_velocity = 0
 
-            # -----------------------------------------
-            # PRINT + SERIAL OUTPUT
-            # -----------------------------------------
-            print(f"{linear_velocity:.3f} m/s")
+                # -----------------------------------------
+                # OUTPUT (angle only)
+                # -----------------------------------------
+                print(f"{smooth_angle:.3f} deg")
 
-            if ser is not None:
-                try:
-                    ser.write(f"{linear_velocity:.3f}\n".encode())
-                except:
-                    pass
+                if ser:
+                    try:
+                        ser.write(f"{smooth_angle:.3f}\n".encode())
+                    except:
+                        pass
 
-            # -----------------------------------------
-            # SHOW ON SCREEN
-            # -----------------------------------------
-            cv2.putText(display, f"v = {linear_velocity:.2f} m/s",
-                        (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    # --------------------------
+    # Maintain 200 Hz loop
+    # --------------------------
+    elapsed = time.time() - loop_start
+    delay = max(0, 0.005 - elapsed)
+    time.sleep(delay)
 
-    cv2.imshow("Mask", mask)
-    cv2.imshow("Tracking", display)
-
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
+# Cleanup
 picam2.close()
-cv2.destroyAllWindows()
-
 if ser:
     ser.close()
+cv2.destroyAllWindows()
