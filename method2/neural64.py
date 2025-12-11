@@ -79,7 +79,7 @@ WEIGHTS_PATH = "speednet64_deg_v1.pth"
 SCALER_PATH  = "speednet64_deg_scalers_v1.npz"
 
 # Camera/vision
-pivot = (120, 50)
+pivot = (120, 10)
 SMOOTHING_WINDOW = 5
 
 GREEN_LOWER = np.array([40, 150, 100], dtype=np.uint8)
